@@ -11,6 +11,11 @@ Method (per trophy, all my own design):
     Exophase refreshes dilute rates as the tracked-player base grows, and
     that dilution shows up as a roughly linear drift on this scale, so the
     line extrapolates it to the target instead of freezing the last read.
+    Before extrapolating, each trophy's slope is shrunk halfway toward the
+    cross-trophy median slope (re-anchored at the fit's weighted mean point,
+    so the level is untouched): the dilution is a shared platform effect,
+    and a 2.7-day history stretched to a 4.5-day horizon would otherwise let
+    one trophy's noisy trend overshoot.
   * Spread: the fit's weighted residual scatter, combined in quadrature with
     a random-walk term that widens with the horizon (0.5 logit units per
     square-root day) and a refresh-jump allowance (0.5 logit units) for the
@@ -29,6 +34,7 @@ import math
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from statistics import median
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
@@ -47,6 +53,12 @@ RESID_FLOOR = 0.05
 # Safety valve on how far the extrapolated median may move from the last
 # observed rate, in logit units.
 MAX_LOGIT_SHIFT = 4.0
+# Shrinkage of each trophy's fitted slope toward the cross-trophy median
+# slope: a 2.7-day history extrapolated to a 4.5-day horizon overshoots
+# when one trophy's short trend is noisy, and the dilution is a shared
+# platform effect, so each trophy keeps half its own deviation from the
+# median trend and borrows the other half from the group.
+SLOPE_SHRINK = 0.5
 
 LO = 0.01
 HI = 99.99
@@ -130,7 +142,25 @@ def weighted_line(xs, ys, ws):
     return (my - b * mx, b)
 
 
-def forecast_trophy(reads, target_time, horizon_days, levels):
+def fitted_slope(reads):
+    """Weighted least-squares slope of logit(rate) vs ln(1 + hours since
+    launch) for one trophy, or None if the history cannot support a fit.
+    Mirrors the fit inside forecast_trophy so forecast_case can shrink
+    each trophy's slope toward the cross-trophy median before forecasting."""
+    usable = [(t, r) for (t, r) in reads if r is not None]
+    if len(usable) < 2:
+        return None
+    last_time = usable[-1][0]
+    xs = [math.log1p(max(0.0, (t - LAUNCH).total_seconds() / 3600.0)) for (t, _) in usable]
+    if len(set(xs)) < 2:
+        return None
+    ys = [logit_of(r) for (_, r) in usable]
+    ws = [0.5 ** ((last_time - t).total_seconds() / 3600.0 / HALF_LIFE_HOURS) for (t, _) in usable]
+    line = weighted_line(xs, ys, ws)
+    return line[1] if line is not None else None
+
+
+def forecast_trophy(reads, target_time, horizon_days, levels, median_slope=None):
     """reads: list of (time, rate-or-None) oldest first for one trophy."""
     usable = [(t, r) for (t, r) in reads if r is not None]
     if not usable:
@@ -151,14 +181,26 @@ def forecast_trophy(reads, target_time, horizon_days, levels):
         resid_sd = RESID_FLOOR
     else:
         a, b = line
+        b_fit = b
+        # Shrink the slope toward the cross-trophy median before
+        # extrapolating: the fitted line is re-anchored at the weighted
+        # mean point (mx, my), so the shrunk slope pivots there rather
+        # than shifting the level. A trophy whose own trend is the median
+        # trend is untouched; an outlier keeps half its deviation.
+        if median_slope is not None:
+            b = median_slope + SLOPE_SHRINK * (b - median_slope)
+        sw = sum(ws)
+        mx = sum(w * x for w, x in zip(ws, xs)) / sw
+        my = sum(w * y for w, y in zip(ws, ys)) / sw
         x_target = math.log1p(max(0.0, (target_time - LAUNCH).total_seconds() / 3600.0))
-        centre = a + b * x_target
+        centre = my + b * (x_target - mx)
         # Keep the extrapolation honest: never move further than the valve
         # allows from where the trophy was last seen.
         centre = min(last_logit + MAX_LOGIT_SHIFT, max(last_logit - MAX_LOGIT_SHIFT, centre))
         centre = min(logit_of(HI), max(logit_of(LO), centre))
-        sw = sum(ws)
-        resid_var = sum(w * (y - (a + b * x)) ** 2 for w, x, y in zip(ws, xs, ys)) / sw
+        # Residuals are measured against the unshrunk fit, not the shrunk
+        # extrapolation, so the spread still reflects the fit's own scatter.
+        resid_var = sum(w * (y - (a + b_fit * x)) ** 2 for w, x, y in zip(ws, xs, ys)) / sw
         resid_sd = math.sqrt(max(resid_var, 0.0))
 
     sigma = math.sqrt(max(resid_sd, RESID_FLOOR) ** 2
@@ -181,15 +223,23 @@ def forecast_case(case):
     history = case.get("history") or []
 
     rows = []
-    for index, trophy in enumerate(trophies):
+    # First pass: each trophy's own fitted slope, so the second pass can
+    # shrink every slope toward the cross-trophy median before
+    # extrapolating. Trophies without a fit do not vote.
+    all_reads = []
+    for index in range(len(trophies)):
         reads = []
         for read in history:
             rates = read.get("rates") or []
             rate = rates[index] if index < len(rates) else None
             reads.append((parse_time(read["at"]), rate))
+        all_reads.append(reads)
+    slopes = [s for s in (fitted_slope(reads) for reads in all_reads) if s is not None]
+    median_slope = median(slopes) if slopes else None
+    for index, trophy in enumerate(trophies):
         rows.append({
             "id": trophy["id"],
-            "q": forecast_trophy(reads, target_time, horizon_days, levels),
+            "q": forecast_trophy(all_reads[index], target_time, horizon_days, levels, median_slope),
         })
     return {"trophies": rows}
 
